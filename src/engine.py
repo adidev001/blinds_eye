@@ -225,11 +225,21 @@ class ModelLoader:
         weight_path = self._models_dir / "depth" / weight_name
 
         if not weight_path.exists():
-            print(
-                f"[ENGINE] Depth model not found at {weight_path}. "
-                "Skipping depth loading — run without depth until weights are supplied."
-            )
-            return None
+            print(f"[ENGINE] Depth model not found at {weight_path}.")
+            print(f"[ENGINE] Downloading depth_anything_v2_small.onnx (~95MB) from Hugging Face. Please wait...")
+            
+            weight_path.parent.mkdir(parents=True, exist_ok=True)
+            import urllib.request
+            url = "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx"
+            try:
+                urllib.request.urlretrieve(url, str(weight_path))
+                print("[ENGINE] Download complete!")
+            except Exception as e:
+                print(f"[ENGINE] Failed to download model: {e}")
+                print("[ENGINE] Skipping depth loading — run without depth until weights are supplied manually.")
+                if weight_path.exists():
+                    weight_path.unlink() # remove partial file
+                return None
 
         # Build execution provider preference list
         providers = self._select_onnx_providers()
