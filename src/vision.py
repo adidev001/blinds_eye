@@ -21,6 +21,27 @@ from typing import Optional
 import cv2
 import numpy as np
 
+# ─────────────────────────────────────────────────────────────────────────
+# Context-Aware Filtering Modes
+# ─────────────────────────────────────────────────────────────────────────
+INDOOR_CLASSES = {
+    "person", "cat", "dog", "chair", "couch", "potted plant", "bed", 
+    "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", 
+    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", 
+    "book", "clock", "vase", "scissors", "teddy bear", "hair drier", 
+    "toothbrush", "backpack", "umbrella", "handbag", "tie", "bottle", 
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", 
+    "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", 
+    "donut", "cake"
+}
+
+OUTDOOR_CLASSES = {
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", 
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign", 
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", 
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag"
+}
+
 # Local imports (lazy — may be None if deps missing)
 try:
     from ultralytics import YOLO
@@ -103,12 +124,21 @@ class VisionPipeline:
         confidence: float = 0.5,
         frame_width: int = 640,
         depth_scale: float = 3.0,
+        mode: str = "all",
     ) -> None:
         self._yolo = yolo_model
         self._depth = depth_session
         self._confidence = confidence
         self._frame_width = frame_width
         self._depth_scale = depth_scale
+        
+        self._mode = mode.lower()
+        if self._mode == "indoor":
+            self._allowed_classes = INDOOR_CLASSES
+        elif self._mode == "outdoor":
+            self._allowed_classes = OUTDOOR_CLASSES
+        else:
+            self._allowed_classes = None # "all" mode allows everything
 
         # Depth input shape cache (set on first frame if depth is loaded)
         self._depth_input_name: Optional[str] = None
@@ -235,15 +265,23 @@ class VisionPipeline:
 
     def _detect(self, frame: np.ndarray, frame_w: int) -> list[Detection]:
         """Run YOLO inference and return a list of Detection objects."""
-        results = self._yolo(frame, conf=self._confidence, verbose=False)[0]
+        yolo_res = self._yolo(frame, conf=self._confidence, verbose=False)[0]
         detections: list[Detection] = []
+        names = self._yolo.names
 
-        for box in results.boxes:
-            xyxy = box.xyxy.cpu().numpy().flatten()
-            conf = float(box.conf.cpu().numpy())
-            cls = int(box.cls.cpu().numpy())
-            label = self._yolo.names[cls]
+        for box in yolo_res.boxes:
+            conf = float(box.conf[0])
+            if conf < self._confidence:
+                continue
 
+            cls_id = int(box.cls[0])
+            label = names[cls_id]
+            
+            # Context-Aware Filtering
+            if self._allowed_classes and label not in self._allowed_classes:
+                continue
+
+            xyxy = box.xyxy[0].cpu().numpy()
             x1, y1, x2, y2 = map(int, xyxy)
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2

@@ -54,6 +54,10 @@ def parse_args() -> argparse.Namespace:
         help="Path to a Piper TTS .onnx voice model (auto-detected from models/tts/ if omitted)",
     )
     ap.add_argument(
+        "--mode", type=str, choices=["indoor", "outdoor", "all"], default="all",
+        help="Context-aware filtering mode (default: all)",
+    )
+    ap.add_argument(
         "--speak-interval", type=float, default=2.0,
         help="Seconds between speech announcements (default: 2.0)",
     )
@@ -147,6 +151,7 @@ def main() -> None:
         confidence=args.confidence,
         frame_width=args.frame_width,
         depth_scale=args.depth_scale,
+        mode=args.mode,
     )
     tracker = AnnouncementTracker(
         absence_reset=args.absence_reset,
