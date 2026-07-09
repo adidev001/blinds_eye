@@ -23,6 +23,7 @@ import cv2
 
 from src.engine import HardwareProbe, ModelLoader
 from src.tts_module import TTSEngine
+import os
 from src.vision import VisionPipeline, AnnouncementTracker
 from src.camera import CameraStream
 
@@ -151,12 +152,20 @@ def main() -> None:
     print()
 
     # ---- Step 6: Main Loop -------------------------------------------
-    window_name = "Blind's Eye — Smart Object Narrator"
-    try:
+    window_name = "Blind's Eye"
+    
+    # Detect if we have a display available (for Docker / Headless Linux)
+    headless = False
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        headless = True
+        print("[INFO] No DISPLAY detected. Running in headless mode (no video window).")
+    
+    if not headless:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-        prev_time = time.time()
+    prev_time = time.time()
+    try:
         while True:
             ret, frame = cap.read()
             if not ret or frame is None:
@@ -186,11 +195,15 @@ def main() -> None:
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2
             )
 
-            cv2.imshow(window_name, display_frame)
+            if not headless:
+                cv2.imshow(window_name, display_frame)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("[INFO] Exit requested (q pressed).")
-                break
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    print("[INFO] Exit requested (q pressed).")
+                    break
+            else:
+                # Slight yield for headless loop
+                time.sleep(0.001)
 
     except KeyboardInterrupt:
         print("\n[INFO] Keyboard interrupt received.")
