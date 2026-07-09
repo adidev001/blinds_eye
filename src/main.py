@@ -46,8 +46,12 @@ def parse_args() -> argparse.Namespace:
         help="Resize frames to this width (default: 640)",
     )
     ap.add_argument(
-        "--speech-rate", type=int, default=170,
-        help="TTS words-per-minute (default: 170)",
+        "--speech-rate", type=float, default=1.0,
+        help="TTS speech speed multiplier: 1.0=normal, 1.3=faster, 0.8=slower (default: 1.0)",
+    )
+    ap.add_argument(
+        "--tts-model", type=str, default=None,
+        help="Path to a Piper TTS .onnx voice model (auto-detected from models/tts/ if omitted)",
     )
     ap.add_argument(
         "--speak-interval", type=float, default=2.0,
@@ -115,8 +119,24 @@ def main() -> None:
         print("[INIT] Depth estimation disabled via --no-depth flag.")
     print()
 
-    # ---- Step 3: Initialize TTS --------------------------------------
-    tts = TTSEngine(speech_rate=args.speech_rate)
+    # ---- Step 3: Initialize TTS (Piper offline backend) -----------------
+    # Auto-discover a Piper voice model under models/tts/ if not specified.
+    from pathlib import Path
+    tts_model_path = None
+    if args.tts_model:
+        tts_model_path = Path(args.tts_model)
+    else:
+        tts_dir = Path("models") / "tts"
+        if tts_dir.exists():
+            candidates = list(tts_dir.glob("*.onnx"))
+            if candidates:
+                tts_model_path = candidates[0]   # pick first available voice
+                print(f"[INIT] Auto-detected Piper voice: {tts_model_path.name}")
+
+    tts = TTSEngine(
+        model_path=tts_model_path,
+        speech_rate_scale=args.speech_rate,
+    )
     tts.speak("Blind's Eye is starting up.")
     print("[INIT] TTS engine started.")
 
