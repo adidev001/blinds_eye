@@ -1,0 +1,27 @@
+# Ignore Heavy Model Weights
+models/**/*.pt
+models/**/*.weights
+models/**/*.engine
+models/**/*.onnx
+
+# Ignore legacy configs if not actively used
+yolo-coco/
+*.cfg
+
+# Ignore Local Virtual Environments (CRITICAL)
+venv/
+.venv/
+env/
+.conda/
+miniconda/
+
+# Ignore Python Caches and IDE files
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Ignore OS metadata
+.DS_Store
+Thumbs.db

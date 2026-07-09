@@ -1,119 +1,97 @@
-# Blind-s-Eye-project
----
+# Blind's Eye
 
-# 🤟 Sign Language Recognition with Text-to-Speech Assistance
+Blind's Eye is an AI-powered real-time object detection and spatial awareness tool. It uses a webcam or IP camera feed to detect objects using **YOLO11** and estimates their real-world distances using **Depth Anything V2**. The detections are then spoken aloud using native text-to-speech (TTS) to provide environmental awareness.
 
-This project is a real-time Sign Language Recognition system** built using **Python, OpenCV, and MediaPipe, enhanced with Text-to-Speech (TTS) technology to assist visually impaired (blind) users.
-
-The system recognizes hand gestures from a webcam, converts them into **American Sign Language (ASL) text**, and then **speaks the recognized sign aloud**, making communication more inclusive and accessible.
-
----
-
-## 🌟 Key Features
-
-* Real-time hand gesture detection using webcam
-* Recognition of basic ASL gestures (A–Z or subset)
-* Live display of recognized sign on video feed
-* **Text-to-Speech output for blind/visually impaired users**
-* Audio feedback of recognized gestures
-* Watermark displayed on screen
+## Features
+- **Real-Time Detection:** Uses YOLO to identify objects and track their left/center/right direction.
+- **Metric Depth Estimation:** Fuses YOLO centroids with the DA-V2 depth map to calculate distance.
+- **Ultra-Low Latency TTS:** Asynchronous background thread using native Windows `win32com` SAPI for instant audio feedback without pipeline lag.
+- **IP Camera Support:** Stream directly from network cameras via HTTP/RTSP URLs.
+- **Anti-Lag Engine:** Background buffer-draining ensures you always process the absolute freshest frame.
 
 ---
 
-## ♿ Accessibility Focus
+## 🛠 Depth Calibration
 
-This project aims to bridge the communication gap by:
+Depth Anything V2 predicts *relative disparity* (inverse depth). To convert this into real-world meters, we apply a mathematical formula: `Distance = Scale / Disparity`. 
 
-* Helping **visually impaired users hear recognized gestures**
-* Supporting **inclusive human–computer interaction**
-* Combining **computer vision + assistive technology**
+Because every camera lens and resolution is slightly different, you may need to calibrate the `--depth-scale` parameter to match your specific setup.
 
----
-
-## 🛠️ Technologies Used
-
-* **Python 3.7+**
-* **OpenCV** – video capture and image processing
-* **MediaPipe** – real-time hand tracking
-* **NumPy** – numerical operations
-* **Text-to-Speech (pyttsx3 / gTTS)** – audio output
-
----
-
-## 📦 Installation
-
-Install all required dependencies:
+### How to Calibrate
+1. Place a recognizable object (like a `laptop` or `cell phone`) exactly **1.0 meter** away from your camera.
+2. Run the program with the default scale:
+   ```bash
+   python -m src.main
+   ```
+3. Listen to the distance it announces. 
+   - If it says **2.0 meters**, your scale is *twice* as high as it should be. 
+   - If it says **0.5 meters**, your scale is *half* what it should be.
+4. Stop the program, and adjust the `--depth-scale` accordingly. (For example, if the default scale of 3.0 gives you 2.0 meters, lower the scale to 1.5).
 
 ```bash
-pip install opencv-python mediapipe numpy pyttsx3
+python -m src.main --depth-scale 1.5
 ```
+5. Repeat until the announced distance closely matches the real physical distance.
 
-*(Optional: For cloud-based voice output)*
+---
+
+## 🚀 Usage
+
+Run the main pipeline directly from your terminal:
 
 ```bash
-pip install gtts playsound
+# Default webcam (0)
+python -m src.main
+
+# Custom Depth Scale
+python -m src.main --depth-scale 2.0
+
+# Using an IP Camera (e.g. from an Android app like IP Webcam)
+python -m src.main --camera "http://192.168.1.10:8080/video"
+
+# Disable Depth Estimation (Only announce object direction)
+python -m src.main --no-depth
 ```
 
----
-
-## ▶️ How to Run the Project
-
-1. Clone the repository:
-
-   ```bash
-   https://github.com/JahnaviSingh2005/Blind-s-Eye-project.git
-   ```
-
-2. Navigate to the project folder:
-
-   ```bash
-   cd sign-language-recognition
-   ```
-
-3. Run the main file:
-
-   ```bash
-   python main.py
-   ```
+### CLI Arguments
+- `--camera`: Camera device index (integer) or IP camera stream URL (default: `0`).
+- `--confidence`: Minimum confidence threshold for YOLO detections (default: `0.5`).
+- `--speech-rate`: Speed of the TTS engine (default: `170`).
+- `--absence-reset`: Seconds an object must disappear before it is re-announced (default: `1.5`).
+- `--depth-scale`: Calibration factor to convert disparity to meters (default: `3.0`).
+- `--no-depth`: Flag to bypass Depth Anything V2.
 
 ---
 
-## 🔊 How Text-to-Speech Works
+## 🐳 Dockerization
 
-* When a hand gesture is recognized:
+You can run Blind's Eye inside a Docker container. The included `Dockerfile` uses an NVIDIA CUDA base image to support hardware acceleration (if available) and falls back to the CPU automatically.
 
-  * The corresponding **ASL character/text** is displayed on screen
-  * The system **converts the text into speech**
-  * The audio output announces the recognized sign aloud
+### 1. Build the Image
+```bash
+docker build -t blinds-eye -f deployment/Dockerfile .
+```
 
-This allows **blind or visually impaired users** to understand gestures through sound.
+### 2. Run the Container
 
----
+**For CPU Only:**
+```bash
+docker run -it --rm \
+    --device /dev/video0 \
+    -e DISPLAY=$DISPLAY \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    blinds-eye
+```
 
-## 📌 Project Notes
+**For NVIDIA GPU Acceleration:**
+*(Requires NVIDIA Container Toolkit installed on the host)*
+```bash
+docker run -it --rm \
+    --gpus all \
+    --device /dev/video0 \
+    -e DISPLAY=$DISPLAY \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    blinds-eye
+```
 
-* Use a **plain background** and **good lighting** for best accuracy
-* Webcam must be properly positioned
-* This is a **prototype/demo-level project**
-* Accuracy depends on gesture clarity and lighting conditions
-
----
-
-## 🔮 Future Enhancements
-
-* Full ASL alphabet and word-level recognition
-* Sentence formation with continuous gestures
-* Deep learning-based gesture classification (CNN / LSTM)
-* Multi-language speech output
-* Mobile or web application integration
-
----
-
-## 👩‍💻 Author
-
-**Jahnavi Singh**
-B.Tech Student | AI, Computer Vision & Assistive Technology Enthusiast
-
----
-
-Just say the word 🚀
+*(Note: If you're on Windows and using Docker Desktop with WSL2, mapping physical webcams into Docker can be complicated. The easiest workaround is to use an IP Camera app on your phone and pass the URL to the `--camera` flag!)*
