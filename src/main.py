@@ -66,6 +66,14 @@ def parse_args() -> argparse.Namespace:
         help="Seconds before a disappeared object can be re-announced (default: 1.5)",
     )
     ap.add_argument(
+        "--min-duration", type=float, default=0.5,
+        help="Seconds an object must be continuously visible before announcing (default: 0.5)",
+    )
+    ap.add_argument(
+        "--max-fps", type=float, default=10.0,
+        help="Cap inference to a max FPS to prevent AI from backing up the pipeline (default: 10.0)",
+    )
+    ap.add_argument(
         "--camera", type=str, default="0",
         help="Camera device index (e.g. 0) or IP camera stream URL",
     )
@@ -156,6 +164,7 @@ def main() -> None:
     tracker = AnnouncementTracker(
         absence_reset=args.absence_reset,
         speak_interval=args.speak_interval,
+        min_duration=args.min_duration,
     )
     print("[INIT] Vision pipeline ready.")
     print()
@@ -187,11 +196,15 @@ def main() -> None:
     
     if not headless:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
 
     prev_time = time.time()
+    min_frame_time = 1.0 / args.max_fps if args.max_fps > 0 else 0
+
     try:
         while True:
+            frame_start = time.time()
+
             ret, frame = cap.read()
             if not ret or frame is None:
                 time.sleep(0.01)
@@ -229,6 +242,11 @@ def main() -> None:
             else:
                 # Slight yield for headless loop
                 time.sleep(0.001)
+
+            # Smart FPS cap: sleep only the remaining time to hit target FPS
+            elapsed = time.time() - frame_start
+            if min_frame_time > 0 and elapsed < min_frame_time:
+                time.sleep(min_frame_time - elapsed)
 
     except KeyboardInterrupt:
         print("\n[INFO] Keyboard interrupt received.")

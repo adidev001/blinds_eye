@@ -159,10 +159,12 @@ class VisionPipeline:
 
     def process_frame(self, frame: np.ndarray) -> FrameResult:
         """
-        Run detection and depth estimation in parallel on *frame*.
+        Run detection and depth estimation on *frame*.
 
-        Returns a `FrameResult` containing detections (with optional
-        per-object depth) and the raw depth map.
+        When depth is enabled, YOLO runs on the main thread while depth
+        runs concurrently in a background thread.  When depth is
+        disabled, everything runs sequentially on the main thread —
+        zero thread-creation overhead.
         """
         h, w = frame.shape[:2]
         if w != self._frame_width:
@@ -170,41 +172,33 @@ class VisionPipeline:
             frame = cv2.resize(frame, (self._frame_width, int(h * scale)))
             h, w = frame.shape[:2]
 
-        # --- Launch parallel threads ----------------------------------
-        det_result: list[Detection] = []
         depth_map: Optional[np.ndarray] = None
-        det_error: Optional[Exception] = None
         depth_error: Optional[Exception] = None
 
-        def _run_detection():
-            nonlocal det_result, det_error
-            try:
-                det_result = self._detect(frame, w)
-            except Exception as e:
-                det_error = e
-
-        def _run_depth():
-            nonlocal depth_map, depth_error
-            try:
-                depth_map = self._estimate_depth(frame)
-            except Exception as e:
-                depth_error = e
-
-        t_det = threading.Thread(target=_run_detection, name="yolo-det")
-        t_det.start()
-
+        # If depth is enabled, kick it off in a background thread
+        # so it runs concurrently with YOLO on the main thread.
+        t_dep = None
         if self._depth is not None:
+            def _run_depth():
+                nonlocal depth_map, depth_error
+                try:
+                    depth_map = self._estimate_depth(frame)
+                except Exception as e:
+                    depth_error = e
+
             t_dep = threading.Thread(target=_run_depth, name="da-v2-depth")
             t_dep.start()
-        else:
-            t_dep = None
 
-        t_det.join()
+        # Run YOLO directly on the main thread (no thread overhead)
+        det_result: list[Detection] = []
+        try:
+            det_result = self._detect(frame, w)
+        except Exception as e:
+            print(f"[VISION] Detection error: {e}")
+
+        # Wait for depth if it was started
         if t_dep is not None:
             t_dep.join()
-
-        if det_error:
-            print(f"[VISION] Detection error: {det_error}")
         if depth_error:
             print(f"[VISION] Depth error: {depth_error}")
 
@@ -218,8 +212,6 @@ class VisionPipeline:
                 dy = int(det.cy * scale_y)
                 dx = min(max(dx, 0), dw - 1)
                 dy = min(max(dy, 0), dh - 1)
-                # Depth map values are in relative scale; convert later
-                # if a metric scale factor is known.
                 det.depth_meters = round(float(depth_map[dy, dx]), 2)
 
         return FrameResult(
@@ -342,18 +334,30 @@ class AnnouncementTracker:
     """
     Tracks detected objects and decides when they should be announced.
 
-    Re-announces an object only if it disappears for longer than
-    `absence_reset` seconds.
+    Temporal Smoothing (Debouncing):
+    - An object must be continuously present for `min_duration` seconds 
+      before it is added to the pending announcement queue.
+    - Re-announces an object only if it disappears for longer than
+      `absence_reset` seconds.
     """
 
     def __init__(
         self,
         absence_reset: float = 1.5,
         speak_interval: float = 2.0,
+        min_duration: float = 0.5,
     ) -> None:
         self._absence_reset = absence_reset
         self._speak_interval = speak_interval
+        self._min_duration = min_duration
+        
+        # When was the object FIRST seen in the current streak?
+        self._first_seen: dict[str, float] = {}
+        # When was the object LAST seen?
         self._last_seen: dict[str, float] = {}
+        # Has this object been announced in the current streak?
+        self._announced: set[str] = set()
+        
         self._pending: set[str] = set()
         self._last_speak_time: float = time.time()
 
@@ -366,29 +370,37 @@ class AnnouncementTracker:
         current_keys: set[str] = set()
 
         for det in detections:
-            # Build a key that includes depth when available
+            # Build the fully formatted speech string (including depth)
             if det.depth_meters is not None:
-                key = f"{det.label} on the {det.direction} at {det.depth_meters:.1f} meters"
+                speech_text = f"{det.label} on the {det.direction} at {det.depth_meters:.1f} meters"
             else:
-                key = f"{det.label} on the {det.direction}"
+                speech_text = f"{det.label} on the {det.direction}"
 
-            # Simplified key for tracking (without depth)
+            # Simplified key for tracking (without depth, so small depth fluctuations don't reset the streak)
             track_key = f"{det.label}_{det.direction}"
             current_keys.add(track_key)
 
-            if track_key not in self._last_seen or \
-               (now - self._last_seen[track_key]) > self._absence_reset:
-                self._pending.add(key)
+            # If it's a new object (or returning after absence_reset), start a new streak
+            if track_key not in self._last_seen or (now - self._last_seen[track_key]) > self._absence_reset:
+                self._first_seen[track_key] = now
+                if track_key in self._announced:
+                    self._announced.remove(track_key)
 
             self._last_seen[track_key] = now
 
-        # Purge disappeared objects
-        self._last_seen = {
-            k: v for k, v in self._last_seen.items()
-            if now - v <= self._absence_reset + 0.5
-        }
+            # If it has been present long enough, and hasn't been announced yet, queue it!
+            if track_key not in self._announced and (now - self._first_seen[track_key]) >= self._min_duration:
+                self._pending.add(speech_text)
+                self._announced.add(track_key)
 
-        # Emit announcement at interval
+        # Purge objects that have disappeared for longer than absence_reset
+        expired_keys = [k for k, v in self._last_seen.items() if (now - v) > self._absence_reset]
+        for k in expired_keys:
+            self._last_seen.pop(k, None)
+            self._first_seen.pop(k, None)
+            self._announced.discard(k)
+
+        # Emit announcement at interval (only if there is something pending)
         if (now - self._last_speak_time) >= self._speak_interval and self._pending:
             items = sorted(self._pending)
             if len(items) > 1:
