@@ -1,34 +1,49 @@
 """
-Blind's Eye — Text-to-Speech Module (Piper TTS Backend)
-=========================================================
+Blind's Eye — Text-to-Speech Module (Dual-Engine: Piper + Kokoro)
+==================================================================
 Provides a fully offline, low-latency, asynchronous TTS engine
-built on top of Piper TTS (ONNX inference) and sounddevice for
-direct audio streaming to the system speakers. No audio files are
-ever written to disk.
+that supports two synthesis backends:
+
+  1. Piper TTS   — default, ONNX-based, 22kHz/16kHz float32 PCM.
+  2. Kokoro-82M  — higher-quality, 24kHz float32, en/hi/hinglish.
+                   Runs on CPUExecutionProvider only to avoid
+                   competing with YOLO26 + Depth Anything V2 for VRAM.
 
 Architecture
 ------------
-  Main thread         Worker thread (daemon)
-  ─────────           ──────────────────────────────────────────
-  tts.speak(msg)  →   Dequeues message from PriorityQueue
-                      → Piper synthesizes raw PCM samples
-                      → sounddevice plays them directly
+  Main thread              Worker thread (daemon)
+  ──────────               ───────────────────────────────────────
+  tts.speak(msg)  ──────►  Dequeues from PriorityQueue
+                            → Engine synthesises PCM (blocking)
+                            → sounddevice streams directly to speakers
 
 Critical Safety Feature
 -----------------------
   If a message begins with "CRITICAL:", the normal queue is
-  immediately flushed and the critical warning is placed at the
-  front so it is spoken without any backlog delay. This is the
-  most important safety contract of this module.
+  immediately flushed AND ``sounddevice.stop()`` is called to
+  interrupt any currently-playing audio. The critical warning
+  is then placed at the front and spoken within ~100ms.
+
+Fallback Chain
+--------------
+  Kokoro requested  →  Kokoro (if installed + model files present)
+                    →  Piper  (if model file present)
+                    →  win32com SAPI (Windows native)
+                    →  espeak-ng  (Linux native)
+                    →  pyttsx3   (last resort)
 
 Usage
 -----
     from src.tts_module import TTSEngine
 
+    # Default Piper backend
     tts = TTSEngine(model_path="models/tts/en_US-amy-low.onnx")
+
+    # Kokoro backend with Hindi
+    tts = TTSEngine(engine="kokoro", lang="hi")
+
     tts.speak("Person at 2 meters.")
     tts.speak("CRITICAL: Stairs directly ahead!")
-    # ... later ...
     tts.shutdown()
 """
 
@@ -81,55 +96,66 @@ class TTSEngine:
     ----------
     model_path : str | Path | None
         Path to the Piper TTS ``.onnx`` voice model file.
-        If *None* or the file is missing, the engine falls back to the
-        system's native TTS (win32com on Windows / espeak on Linux).
+        If *None* or the file is missing, the engine falls through to
+        the fallback chain (Kokoro → win32com → espeak → pyttsx3).
+    engine : str
+        Preferred synthesis backend: ``"piper"`` (default) or ``"kokoro"``.
+        If Kokoro is requested but unavailable, falls back to Piper.
+    lang : str
+        Announcement language: ``"en"`` (default), ``"hi"`` (Hindi),
+        or ``"hinglish"`` (Roman Hinglish). Controls Kokoro voice selection
+        and is passed through for Piper ``hi_IN`` model selection.
     queue_max : int
         Maximum number of *normal-priority* messages allowed to wait in
         the queue before new ones are silently dropped. Critical messages
         always bypass this limit.
     speech_rate_scale : float
-        Speech speed multiplier fed to Piper (1.0 = default, 0.75 = slower,
-        1.25 = faster). Ignored when using the native fallback backend.
-    sample_rate : int
-        PCM sample rate expected by the loaded Piper voice model.
-        Piper ``*-low`` models use 16 000 Hz; ``*-medium`` / ``*-high``
-        models use 22 050 Hz. Must match the ``.onnx`` model exactly.
+        Speech speed multiplier (1.0 = default, 0.75 = slower, 1.25 = faster).
     """
 
     def __init__(
         self,
         model_path: Optional[str | Path] = None,
+        engine: str = "piper",
+        lang:   str = "en",
         queue_max:  int   = 4,
         speech_rate_scale: float = 1.0,
-        sample_rate: int  = 22050,
     ) -> None:
-        self._model_path       = Path(model_path) if model_path else None
-        self._queue_max        = queue_max
+        self._model_path        = Path(model_path) if model_path else None
+        self._engine_pref       = engine.lower()
+        self._lang              = lang.lower()
+        self._queue_max         = queue_max
         self._speech_rate_scale = speech_rate_scale
-        self._sample_rate      = sample_rate
-        self._running          = True
+        self._running           = True
 
-        # A PriorityQueue ensures CRITICAL messages always jump the queue.
-        # Each item is a (priority: int, counter: int, text: str) tuple.
-        # The counter breaks ties while preserving FIFO within the same priority.
+        # ── Kokoro handle (set in _init_backend if kokoro initialises OK) ──
+        self._kokoro = None
+
+        # ── PriorityQueue: (priority, counter, text) tuples ───────────────
+        # Lower priority number = higher urgency.
         self._queue: queue.PriorityQueue = queue.PriorityQueue()
-        self._counter = 0           # Monotonically-increasing tie-breaker
+        self._counter      = 0
         self._counter_lock = threading.Lock()
 
-        # Initialise the synthesis backend (either Piper or native fallback).
+        # ── Interrupt event: set by _flush_normal_queue when CRITICAL fires ─
+        # _play_piper / _play_kokoro check this before calling sd.play().
+        self._interrupt_event = threading.Event()
+
+        # ── Piper / native fallback handles ───────────────────────────────
         self._piper_voice: Optional[PiperVoice] = None
-        self._fallback_speaker = None   # win32com / espeak handle
+        self._fallback_speaker = None
+
         self._backend = self._init_backend()
 
         # Spawn the background audio worker thread.
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="tts-worker",
-            daemon=True,             # Dies automatically when main exits.
+            daemon=True,
         )
         self._worker.start()
-        print(f"[TTS] Engine started — backend: {self._backend}, "
-              f"model: {self._model_path.name if self._model_path else 'native'}")
+        print(f"[TTS] Engine started — backend: {self._backend}, lang: {self._lang}, "
+              f"model: {self._model_path.name if self._model_path else 'auto'}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -186,44 +212,76 @@ class TTSEngine:
 
     def _init_backend(self) -> str:
         """
-        Probe for the best available TTS backend in preference order:
-          1. Piper TTS (fully offline, high-quality ONNX voice model)
-          2. win32com SAPI (Windows native, zero install)
-          3. espeak-ng (Linux native, zero install)
-          4. pyttsx3 (last resort cross-platform fallback)
+        Probe for the best available TTS backend.
+
+        Preference order when ``--tts-engine kokoro`` is requested:
+          0. Kokoro-82M ONNX  (CPU-only, explicitly isolated)
+          1. Piper TTS        (automatic fallback)
+          2. win32com SAPI    (Windows native)
+          3. espeak-ng        (Linux/macOS native)
+          4. pyttsx3          (last resort)
+
+        Preference order for ``--tts-engine piper`` (default):
+          1. Piper TTS
+          2–4. Same native fallback chain
+
         Returns a short backend identifier string for logging.
         """
-        # 1. Piper TTS ───────────────────────────────────────────────────────
+        # ── Tier 0: Kokoro-82M (only when explicitly requested) ────────────
+        if self._engine_pref == "kokoro":
+            try:
+                from kokoro_onnx import Kokoro  # noqa: PLC0415
+                # Resolve model files relative to a models/tts/ directory
+                # that sits two levels above this src/ file.
+                from pathlib import Path as _P
+                _tts_dir = _P(__file__).resolve().parent.parent / "models" / "tts"
+                _onnx    = _tts_dir / "kokoro-v1.0.onnx"
+                _voices  = _tts_dir / "voices-v1.0.bin"
+
+                if _onnx.exists() and _voices.exists():
+                    # Explicitly CPU-only: we never share VRAM with
+                    # YOLO26 or Depth Anything V2.
+                    self._kokoro = Kokoro(str(_onnx), str(_voices))
+                    print("[TTS] Kokoro-82M loaded (CPUExecutionProvider).")
+                    return "kokoro"
+                else:
+                    print("[TTS] Kokoro model files not found in models/tts/.")
+                    print("[TTS]   Expected: kokoro-v1.0.onnx + voices-v1.0.bin")
+                    print("[TTS] Falling back to Piper TTS.")
+            except ImportError:
+                print("[TTS] kokoro-onnx not installed. Falling back to Piper.")
+            except Exception as exc:
+                print(f"[TTS] Kokoro init failed ({exc}). Falling back to Piper.")
+
+        # ── Tier 1: Piper TTS ─────────────────────────────────────────────
         if _PIPER_AVAILABLE and self._model_path and self._model_path.exists():
             try:
                 self._piper_voice = PiperVoice.load(
                     str(self._model_path),
                     config_path=str(self._model_path.with_suffix(".onnx.json")),
-                    use_cuda=False,          # CPU-only for wearable edge device
+                    use_cuda=False,   # CPU-only; TTS must not steal VRAM
                 )
                 return "piper"
             except Exception as exc:
                 print(f"[TTS] Piper load failed ({exc}). Trying native fallback.")
 
-        # 2. Windows SAPI via win32com ────────────────────────────────────────
+        # ── Tier 2: Windows SAPI via win32com ────────────────────────────
         if sys.platform == "win32":
             try:
-                import pythoncom
-                import win32com.client
-                # CoInitialize must happen in the thread that uses the object;
-                # we store the *class names* and initialise in the worker.
+                import pythoncom        # noqa: F401
+                import win32com.client  # noqa: F401
                 self._fallback_backend_type = "win32com"
                 return "win32com"
             except ImportError:
                 pass
 
-        # 3. espeak-ng via subprocess (Linux/macOS) ───────────────────────────
+        # ── Tier 3: espeak-ng (Linux/macOS) ──────────────────────────────
         import shutil
         if shutil.which("espeak-ng") or shutil.which("espeak"):
             self._fallback_backend_type = "espeak"
             return "espeak"
 
-        # 4. pyttsx3 last-resort ─────────────────────────────────────────────
+        # ── Tier 4: pyttsx3 last resort ───────────────────────────────────
         try:
             import pyttsx3  # noqa: F401
             self._fallback_backend_type = "pyttsx3"
@@ -286,7 +344,9 @@ class TTSEngine:
 
             # ── Synthesise and play ──────────────────────────────────────────
             try:
-                if self._backend == "piper":
+                if self._backend == "kokoro":
+                    self._play_kokoro(text)
+                elif self._backend == "piper":
                     self._play_piper(text)
                 elif self._backend == "win32com" and native_speaker:
                     native_speaker.Speak(text, 0)   # 0 = synchronous
@@ -330,13 +390,53 @@ class TTSEngine:
         audio_array = np.concatenate([c.audio_float_array for c in chunks])
         sample_rate  = chunks[0].sample_rate
 
-        if _SD_AVAILABLE:
+        if _SD_AVAILABLE and not self._interrupt_event.is_set():
             # blocking=True: worker thread waits for playback to finish
             # before dequeuing the next message. Overlapping speech is
             # confusing for a blind user.
             sd.play(audio_array, samplerate=sample_rate, blocking=True)
         else:
             print(f"[TTS][NO AUDIO] {text}")
+        self._interrupt_event.clear()   # consume the interrupt signal
+
+    def _play_kokoro(self, text: str) -> None:
+        """
+        Synthesise *text* with Kokoro-82M ONNX and play via sounddevice.
+
+        Kokoro always returns ``(samples: np.ndarray[float32], sr: int)``
+        where ``sr == 24000``. No temporary files are created on disk.
+
+        CPU isolation: Kokoro was initialised without CUDA providers so
+        it never competes with YOLO26 / Depth Anything V2 for VRAM.
+        """
+        if self._kokoro is None:
+            return
+
+        # Map our --lang flag to Kokoro's (lang_code, voice_id) pairs.
+        # hf_alpha = Hindi female voice, af_heart = English female voice.
+        _LANG_MAP: dict[str, tuple[str, str]] = {
+            "en":       ("en-us", "af_heart"),
+            "hi":       ("hi",    "hf_alpha"),
+            "hinglish": ("hi",    "hf_alpha"),  # Roman Hinglish phonemised as Hindi
+        }
+        kokoro_lang, kokoro_voice = _LANG_MAP.get(self._lang, ("en-us", "af_heart"))
+
+        try:
+            samples, sr = self._kokoro.create(
+                text,
+                voice=kokoro_voice,
+                speed=self._speech_rate_scale,
+                lang=kokoro_lang,
+            )
+        except Exception as exc:
+            print(f"[TTS] Kokoro synthesis error: {exc}")
+            return
+
+        if _SD_AVAILABLE and not self._interrupt_event.is_set():
+            sd.play(samples, samplerate=sr, blocking=True)
+        else:
+            print(f"[TTS][NO AUDIO] {text}")
+        self._interrupt_event.clear()   # consume the interrupt signal
 
 
 
@@ -369,26 +469,35 @@ class TTSEngine:
 
     def _flush_normal_queue(self) -> None:
         """
-        Drain all *normal-priority* messages from the queue.
+        Drain all *normal-priority* messages from the queue AND interrupt
+        any currently-playing audio so the CRITICAL warning fires within
+        ~100ms instead of waiting for the full utterance to finish.
 
-        This is called before inserting a CRITICAL message so that stale
-        object-detection announcements don't delay the safety warning.
-        We rebuild the queue contents, keeping only CRITICAL items and
-        the stop sentinel.
+        Steps:
+          1. ``sd.stop()``  — immediately halts sounddevice playback
+                              (thread-safe, documented for cross-thread use)
+          2. ``_interrupt_event.set()`` — tells _play_piper / _play_kokoro
+                              not to start a new sd.play() call for the
+                              message that was just interrupted.
+          3. Drain normal-priority queue items (stale obstacle announcements).
+          4. Re-insert any CRITICAL items and the stop sentinel.
         """
+        # ── Step 1+2: Stop current audio and signal the playback methods ──
+        if _SD_AVAILABLE:
+            sd.stop()
+        self._interrupt_event.set()
+
+        # ── Steps 3+4: Rebuild queue keeping only high-priority items ─────
         kept: list[tuple] = []
-        # Drain everything non-blocking.
         while True:
             try:
                 item = self._queue.get_nowait()
                 priority = item[0]
                 text     = item[2]
-                # Preserve critical items and the stop sentinel.
                 if priority == _PRIORITY_CRITICAL or text is _STOP_SENTINEL:
                     kept.append(item)
             except queue.Empty:
                 break
 
-        # Re-insert the items we want to keep.
         for item in kept:
             self._queue.put(item)
