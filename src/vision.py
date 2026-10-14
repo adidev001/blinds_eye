@@ -53,6 +53,8 @@ try:
 except ImportError:
     ort = None  # type: ignore[assignment]
 
+from src.localization import LocalizationFormatter
+
 
 # ======================================================================
 # Data Structures
@@ -346,10 +348,13 @@ class AnnouncementTracker:
         absence_reset: float = 1.5,
         speak_interval: float = 2.0,
         min_duration: float = 0.5,
+        lang: str = "en",
     ) -> None:
         self._absence_reset = absence_reset
         self._speak_interval = speak_interval
         self._min_duration = min_duration
+        self._lang = lang
+        self._fmt = LocalizationFormatter(lang)
         
         # When was the object FIRST seen in the current streak?
         self._first_seen: dict[str, float] = {}
@@ -370,11 +375,10 @@ class AnnouncementTracker:
         current_keys: set[str] = set()
 
         for det in detections:
-            # Build the fully formatted speech string (including depth)
-            if det.depth_meters is not None:
-                speech_text = f"{det.label} on the {det.direction} at {det.depth_meters:.1f} meters"
-            else:
-                speech_text = f"{det.label} on the {det.direction}"
+            # Build the fully formatted localized speech string (including depth)
+            speech_text = self._fmt.format_detection(
+                det.label, det.direction, det.depth_meters
+            )
 
             # Simplified key for tracking (without depth, so small depth fluctuations don't reset the streak)
             track_key = f"{det.label}_{det.direction}"
@@ -403,10 +407,7 @@ class AnnouncementTracker:
         # Emit announcement at interval (only if there is something pending)
         if (now - self._last_speak_time) >= self._speak_interval and self._pending:
             items = sorted(self._pending)
-            if len(items) > 1:
-                msg = "I see: " + ", ".join(items)
-            else:
-                msg = f"I see {items[0]}"
+            msg = self._fmt.format_announcement(items)
             self._pending.clear()
             self._last_speak_time = now
             return msg
