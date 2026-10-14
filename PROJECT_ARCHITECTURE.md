@@ -8,7 +8,7 @@ This document provides a comprehensive end-to-end breakdown of the "Blind's Eye"
 Blind's Eye is an assistive wearable/portable device software stack designed for visually impaired users. It processes live video (via webcam or IP camera), detects objects, estimates their real-world distances, and announces them via an offline, ultra-low-latency Text-to-Speech (TTS) engine.
 
 ## 2. Core Technologies
-- **Object Detection:** YOLOv11 (via `ultralytics`)
+- **Object Detection:** YOLO26 (via `ultralytics`) — NMS-Free, 43% faster CPU inference vs YOLOv11
 - **Monocular Depth Estimation:** Depth Anything V2 Small (via `onnxruntime-gpu`)
 - **Speech Synthesis:** Piper TTS (Offline, ONNX-based, native PCM audio streaming)
 - **Vision/Matrix Math:** OpenCV (`cv2`) and NumPy
@@ -25,7 +25,7 @@ The system is designed around **asynchronous decoupling**. AI models, camera har
 - **Solution:** A background daemon thread continuously reads and discards frames as fast as possible, storing only the absolute newest frame in a variable. The main AI loop grabs this variable, guaranteeing zero-latency real-time video.
 
 ### B. The Vision Engine (`src/vision.py` & `src/engine.py`)
-- **Hardware Routing:** `src/engine.py` dynamically detects NVIDIA GPUs. It loads YOLO via PyTorch/CUDA and forces `onnxruntime-gpu` to use `CUDAExecutionProvider` or `TensorrtExecutionProvider` for the Depth model.
+- **Hardware Routing:** `src/engine.py` dynamically detects NVIDIA GPUs. It loads YOLO26 via PyTorch/CUDA and forces `onnxruntime-gpu` to use `CUDAExecutionProvider` or `TensorrtExecutionProvider` for the Depth model.
 - **Inference Pipeline (`process_frame`):**
   1. **Parallel Execution:** YOLO is incredibly fast (~15ms) but Depth Anything V2 is heavier (~150-200ms). To maximize FPS, Depth runs in a background thread while YOLO runs concurrently on the main thread.
   2. **Centroid Extraction:** YOLO outputs bounding boxes. The center `(cx, cy)` of the box is calculated.

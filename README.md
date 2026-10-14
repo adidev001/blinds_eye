@@ -2,7 +2,7 @@
 
 > **AI-powered real-time spatial awareness for the visually impaired**
 
-Blind's Eye is a wearable assistive device that uses **YOLOv11** for object detection and **Depth Anything V2** for monocular depth estimation to help blind users navigate safely. It announces detected obstacles, their direction (left / center / right), and distance in meters through a fully **offline, low-latency Text-to-Speech** engine (Piper TTS).
+Blind's Eye is a wearable assistive device that uses **YOLO26** for object detection and **Depth Anything V2** for monocular depth estimation to help blind users navigate safely. It announces detected obstacles, their direction (left / center / right), and distance in meters through a fully **offline, low-latency Text-to-Speech** engine (Piper TTS).
 
 ---
 
@@ -10,7 +10,7 @@ Blind's Eye is a wearable assistive device that uses **YOLOv11** for object dete
 
 | Feature | Description |
 |---|---|
-| **Real-Time Detection** | YOLOv11 identifies 80+ object classes at 40–60 FPS on GPU |
+| **Real-Time Detection** | YOLO26 identifies 80+ object classes — NMS-Free, 43% faster CPU inference |
 | **3D Depth Estimation** | Depth Anything V2 (ONNX) calculates real-world distance in meters |
 | **Offline TTS** | Piper TTS with priority queue — critical warnings preempt normal speech |
 | **Context Modes** | Indoor / Outdoor / All filtering to reduce irrelevant announcements |

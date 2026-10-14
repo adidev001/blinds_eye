@@ -6,7 +6,7 @@ Here is the updated, comprehensive Product Requirements Document (PRD) for proje
 
 **Phase:** Architecture Refactor, Environment Isolation & Cross-Hardware Deployment
 
-**Core Tech Stack:** Python, Ultralytics YOLOv11, Depth Anything V2, PyTorch, ONNX Runtime, Docker, Conda / Venv
+**Core Tech Stack:** Python, Ultralytics YOLO26, Depth Anything V2, PyTorch, ONNX Runtime, Docker, Conda / Venv
 
 ## 1. Executive Summary
 

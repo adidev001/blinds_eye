@@ -145,9 +145,9 @@ _MODELS_DIR = _PROJECT_ROOT / "models"
 
 # Tier → YOLO weight filename mapping
 _YOLO_TIER_MAP: dict[Tier, str] = {
-    Tier.TIER_1_SERVER: "yolo11m.pt",    # Medium / Large for server
-    Tier.TIER_2_EDGE:   "yolo11n.pt",    # Nano for edge
-    Tier.TIER_3_CPU:    "yolo11n.pt",    # Nano for CPU
+    Tier.TIER_1_SERVER: "yolo26m.pt",    # Medium for server (A100)
+    Tier.TIER_2_EDGE:   "yolo26n.pt",    # Nano for edge (RTX 4050)
+    Tier.TIER_3_CPU:    "yolo26n.pt",    # Nano for CPU — 43% faster on CPU!
 }
 
 # Tier → Depth Anything V2 weight filename mapping
