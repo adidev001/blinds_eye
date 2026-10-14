@@ -32,6 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxrender1 \
         libespeak1 \
         espeak \
+        libportaudio2 \
+        alsa-utils \
         ffmpeg \
         v4l-utils \
     && rm -rf /var/lib/apt/lists/*
@@ -46,7 +48,8 @@ WORKDIR /app
 # ---- Install Python deps ----
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir onnxruntime-gpu --force-reinstall
 
 # ---- Copy application code ----
 COPY src/ ./src/

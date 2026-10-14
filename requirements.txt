@@ -3,7 +3,9 @@ torch>=2.0.0
 torchvision>=0.15.0
 
 # Inference Engines (Cross-Hardware Support)
-onnxruntime>=1.17.0
+# NOTE: kokoro-onnx depends on onnxruntime. On GPU systems, avoid bare
+# 'onnxruntime' package overwriting CUDA providers by ensuring onnxruntime-gpu:
+#   pip install onnxruntime-gpu --force-reinstall
 onnxruntime-gpu>=1.17.0
 
 # Vision & Analytics
@@ -11,9 +13,12 @@ ultralytics>=8.3.0   # Minimum version with YOLO26 support
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 
-# Audio/TTS — Piper (offline, ONNX-powered, high-quality)
+# Audio/TTS — Dual Engine (Piper + Kokoro-82M ONNX)
 piper-tts>=1.2.0
 sounddevice>=0.4.6
+kokoro-onnx>=0.6.0   # Kokoro-82M ONNX offline TTS (en, hi, hinglish)
+psutil>=5.9.0        # Benchmark and resource telemetry
 
-# Fallback TTS (used if Piper model file is not present)
+# Fallback TTS (used if neural TTS model files are not present)
 pyttsx3>=2.90
+

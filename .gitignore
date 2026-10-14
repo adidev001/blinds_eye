@@ -1,8 +1,11 @@
 # Ignore Heavy Model Weights
+*.pt
 models/**/*.pt
 models/**/*.weights
 models/**/*.engine
 models/**/*.onnx
+models/**/*.bin
+
 
 # Ignore legacy configs if not actively used
 yolo-coco/
