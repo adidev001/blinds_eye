@@ -16,8 +16,15 @@ Usage
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
 import sys
 import time
+
+# Ensure project root is on sys.path for direct script execution
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import cv2
 
@@ -48,6 +55,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--speech-rate", type=float, default=1.0,
         help="TTS speech speed multiplier: 1.0=normal, 1.3=faster, 0.8=slower (default: 1.0)",
+    )
+    ap.add_argument(
+        "--tts-engine", type=str, choices=["piper", "kokoro"], default="piper",
+        help="TTS synthesis engine: 'piper' (default) or 'kokoro' (Kokoro-82M ONNX)",
+    )
+    ap.add_argument(
+        "--lang", type=str, choices=["en", "hi", "hinglish"], default="en",
+        help="Announcement language: 'en' (default), 'hi' (Hindi), 'hinglish' (Roman Hinglish)",
     )
     ap.add_argument(
         "--tts-model", type=str, default=None,
@@ -131,22 +146,32 @@ def main() -> None:
         print("[INIT] Depth estimation disabled via --no-depth flag.")
     print()
 
-    # ---- Step 3: Initialize TTS (Piper offline backend) -----------------
-    # Auto-discover a Piper voice model under models/tts/ if not specified.
+    # ---- Step 3: Initialize TTS (Dual-Engine: Piper + Kokoro) ---------
     from pathlib import Path
     tts_model_path = None
     if args.tts_model:
         tts_model_path = Path(args.tts_model)
-    else:
+    elif args.tts_engine == "piper":
         tts_dir = Path("models") / "tts"
         if tts_dir.exists():
-            candidates = list(tts_dir.glob("*.onnx"))
-            if candidates:
-                tts_model_path = candidates[0]   # pick first available voice
+            # If Hindi language requested, prefer hi_IN model if present and configured
+            if args.lang in ("hi", "hinglish"):
+                hi_candidates = list(tts_dir.glob("hi_IN*.onnx"))
+                for c in hi_candidates:
+                    if c.with_suffix(".onnx.json").exists():
+                        tts_model_path = c
+                        break
+            if not tts_model_path:
+                candidates = [p for p in tts_dir.glob("*.onnx") if not p.name.startswith("kokoro")]
+                if candidates:
+                    tts_model_path = candidates[0]   # pick first available voice
+            if tts_model_path:
                 print(f"[INIT] Auto-detected Piper voice: {tts_model_path.name}")
 
     tts = TTSEngine(
         model_path=tts_model_path,
+        engine=args.tts_engine,
+        lang=args.lang,
         speech_rate_scale=args.speech_rate,
     )
     tts.speak("Blind's Eye is starting up.")
@@ -165,6 +190,7 @@ def main() -> None:
         absence_reset=args.absence_reset,
         speak_interval=args.speak_interval,
         min_duration=args.min_duration,
+        lang=args.lang,
     )
     print("[INIT] Vision pipeline ready.")
     print()
