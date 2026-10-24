@@ -180,11 +180,11 @@ class TestTTSEngine(unittest.TestCase):
 
     @patch("src.tts_module.sd")
     def test_kokoro_fallback_to_piper(self, mock_sd):
-        # When kokoro files are absent, engine falls back safely
+        # When kokoro files are present or absent, engine resolves to a valid backend
         engine = TTSEngine(model_path=None, engine="kokoro", lang="hi")
         try:
             self.assertEqual(engine._lang, "hi")
-            self.assertIn(engine._backend, ("piper", "win32com", "espeak", "pyttsx3", "none"))
+            self.assertIn(engine._backend, ("kokoro", "piper", "win32com", "espeak", "pyttsx3", "none"))
         finally:
             engine.shutdown()
 

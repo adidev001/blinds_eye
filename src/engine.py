@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import platform
+import sys
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
@@ -25,6 +26,28 @@ try:
     import torch
 except ImportError:
     torch = None  # type: ignore[assignment]
+
+# On Windows, CUDA / cuDNN DLLs bundled with PyTorch (cudnn64_9.dll etc.)
+# and CUDA Toolkit need to be explicitly registered via add_dll_directory
+# so onnxruntime-gpu can locate them.
+if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+    if torch is not None:
+        _torch_lib = Path(torch.__file__).parent / "lib"
+        if _torch_lib.is_dir():
+            try:
+                os.add_dll_directory(str(_torch_lib))
+            except Exception:
+                pass
+            os.environ["PATH"] = str(_torch_lib) + os.pathsep + os.environ.get("PATH", "")
+    _cuda_path = os.environ.get("CUDA_PATH")
+    if _cuda_path:
+        _cuda_bin = Path(_cuda_path) / "bin"
+        if _cuda_bin.is_dir():
+            try:
+                os.add_dll_directory(str(_cuda_bin))
+            except Exception:
+                pass
+            os.environ["PATH"] = str(_cuda_bin) + os.pathsep + os.environ.get("PATH", "")
 
 try:
     from ultralytics import YOLO
@@ -197,11 +220,18 @@ class ModelLoader:
 
         weight_name = _YOLO_TIER_MAP[self._profile.tier]
         weight_path = self._models_dir / "detection" / weight_name
+        onnx_path = weight_path.with_suffix(".onnx")
 
-        # Ultralytics auto-downloads if the path doesn't exist — just
-        # pass the filename and let it resolve.
-        source = str(weight_path) if weight_path.exists() else weight_name
-        print(f"[ENGINE] Loading YOLO model: {source} (Tier {self._profile.tier.name})")
+        # Unified ONNX preference (FR-1.8)
+        if onnx_path.exists():
+            source = str(onnx_path)
+            print(f"[ENGINE] Loading YOLO model (Unified ONNX preference): {source} (Tier {self._profile.tier.name})")
+        elif weight_path.exists():
+            source = str(weight_path)
+            print(f"[ENGINE] Loading YOLO model: {source} (Tier {self._profile.tier.name})")
+        else:
+            source = weight_name
+            print(f"[ENGINE] Loading YOLO model: {source} (Tier {self._profile.tier.name})")
 
         self._yolo_model = YOLO(source)
         return self._yolo_model

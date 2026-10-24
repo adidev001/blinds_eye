@@ -10,6 +10,7 @@ onnxruntime-gpu>=1.17.0
 
 # Vision & Analytics
 ultralytics>=8.3.0   # Minimum version with YOLO26 support
+lap>=0.5.12          # Linear assignment solver for ByteTrack
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 

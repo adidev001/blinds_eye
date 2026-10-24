@@ -47,16 +47,98 @@ Usage
     tts.shutdown()
 """
 
-from __future__ import annotations
-
+import functools
 import queue
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Audio & Psychoacoustic Helpers (FR-4.2, FR-4.3)
+# ══════════════════════════════════════════════════════════════════════════
+
+def generate_tone(
+    freq_hz: float,
+    duration_sec: float,
+    sr: int = 22050,
+    amp: float = 0.35,
+) -> np.ndarray:
+    """
+    Generate a sine tone with a 5ms raised-cosine (Hann) taper on both ends (FR-4.3).
+    Guarantees first and last samples are exactly 0.0 (zero digital speaker clicks).
+    """
+    num_samples = max(int(round(sr * duration_sec)), 2)
+    t = np.arange(num_samples, dtype=np.float32) / float(sr)
+    tone = (amp * np.sin(2.0 * np.pi * freq_hz * t)).astype(np.float32)
+
+    # 5ms taper on both ends
+    taper_len = min(int(round(sr * 0.005)), num_samples // 2)
+    if taper_len > 0:
+        hann_window = np.hanning(2 * taper_len).astype(np.float32)
+        tone[:taper_len] *= hann_window[:taper_len]
+        tone[-taper_len:] *= hann_window[taper_len:]
+    tone[0] = 0.0
+    tone[-1] = 0.0
+    return tone
+
+
+def pan_audio(
+    audio_mono: np.ndarray,
+    direction: str = "center",
+    stereo: bool = True,
+) -> np.ndarray:
+    """
+    Pan a 1D mono float32 waveform across stereo channels (FR-4.2).
+    Safe gain matrix preserves single-earbud audibility (100/35 safe panning):
+      Left:   [1.00, 0.35]
+      Center: [0.85, 0.85]
+      Right:  [0.35, 1.00]
+    When stereo is False, returns 1D array (N,) unchanged.
+    """
+    if not stereo:
+        return audio_mono
+
+    gains = {
+        "left":   np.array([1.00, 0.35], dtype=np.float32),
+        "center": np.array([0.85, 0.85], dtype=np.float32),
+        "right":  np.array([0.35, 1.00], dtype=np.float32),
+    }.get(direction, np.array([0.85, 0.85], dtype=np.float32))
+
+    return np.outer(audio_mono, gains)
+
+
+def generate_critical_prebeep(
+    direction: str = "center",
+    sample_rate: int = 22050,
+    stereo: bool = True,
+) -> np.ndarray:
+    """
+    Generate an 80ms dual-tone Hann earcon chime (40ms @ 880Hz + 40ms @ 1320Hz)
+    panned across stereo channels (FR-4.3).
+    """
+    tone1 = generate_tone(880.0, 0.040, sr=sample_rate, amp=0.35)
+    tone2 = generate_tone(1320.0, 0.040, sr=sample_rate, amp=0.35)
+    chime = np.concatenate([tone1, tone2])
+    return pan_audio(chime, direction=direction, stereo=stereo)
+
+
+apply_stereo_panning = pan_audio
+
+
+def detect_direction_from_text(text: str) -> str:
+    """Detect spatial direction from formatted announcement string."""
+    lower = text.lower()
+    if "left" in lower or "बाईं" in text or "baayein" in lower:
+        return "left"
+    elif "right" in lower or "दाईं" in text or "daayein" in lower:
+        return "right"
+    return "center"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional imports — degrade gracefully when libraries are absent so that
@@ -120,6 +202,9 @@ class TTSEngine:
         lang:   str = "en",
         queue_max:  int   = 4,
         speech_rate_scale: float = 1.0,
+        stereo: bool = True,
+        heartbeat: bool = False,
+        critical_sound: bool = True,
     ) -> None:
         self._model_path        = Path(model_path) if model_path else None
         self._engine_pref       = engine.lower()
@@ -127,18 +212,32 @@ class TTSEngine:
         self._queue_max         = queue_max
         self._speech_rate_scale = speech_rate_scale
         self._running           = True
+        self._critical_sound    = critical_sound
+
+        # Hardware audio channel auto-negotiation (FR-4.2)
+        self._stereo = stereo
+        self._heartbeat = heartbeat
+        self.last_spoken_time = time.monotonic()
+        self._staleness_fn: Optional[Callable[[], bool]] = None
+        if self._stereo and _SD_AVAILABLE:
+            try:
+                device_info = sd.query_devices(kind="output")
+                max_ch = int(device_info.get("max_output_channels", 2))
+                if max_ch < 2:
+                    print(f"[TTS] Output device has only {max_ch} channels — forcing mono.")
+                    self._stereo = False
+            except Exception:
+                pass
 
         # ── Kokoro handle (set in _init_backend if kokoro initialises OK) ──
         self._kokoro = None
 
         # ── PriorityQueue: (priority, counter, text) tuples ───────────────
-        # Lower priority number = higher urgency.
         self._queue: queue.PriorityQueue = queue.PriorityQueue()
         self._counter      = 0
         self._counter_lock = threading.Lock()
 
         # ── Interrupt event: set by _flush_normal_queue when CRITICAL fires ─
-        # _play_piper / _play_kokoro check this before calling sd.play().
         self._interrupt_event = threading.Event()
 
         # ── Piper / native fallback handles ───────────────────────────────
@@ -155,13 +254,70 @@ class TTSEngine:
         )
         self._worker.start()
         print(f"[TTS] Engine started — backend: {self._backend}, lang: {self._lang}, "
-              f"model: {self._model_path.name if self._model_path else 'auto'}")
+              f"model: {self._model_path.name if self._model_path else 'auto'}, stereo: {self._stereo}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
     # ─────────────────────────────────────────────────────────────────────────
 
+    def set_staleness_fn(self, fn: Callable[[], bool]) -> None:
+        """Register camera staleness callback for heartbeat gating (FR-4.3)."""
+        self._staleness_fn = fn
+
+    @property
+    def critical_sound(self) -> bool:
+        """Return whether critical earcon chimes and urgent prefix are enabled."""
+        return self._critical_sound
+
+    @critical_sound.setter
+    def critical_sound(self, enabled: bool) -> None:
+        self._critical_sound = bool(enabled)
+
+    def toggle_critical_sound(self) -> bool:
+        """Toggle critical earcon chime and urgent prefix on/off. Returns new state."""
+        self._critical_sound = not self._critical_sound
+        state = "ENABLED" if self._critical_sound else "DISABLED"
+        print(f"[TTS] Critical hazard sound: {state}")
+        return self._critical_sound
+
+    @property
+    def stereo(self) -> bool:
+        """Return whether stereo spatialization is enabled."""
+        return self._stereo
+
+    @stereo.setter
+    def stereo(self, enabled: bool) -> None:
+        self._stereo = bool(enabled)
+
+    def toggle_stereo(self) -> bool:
+        """Toggle stereo audio spatialization on/off. Returns new state."""
+        self._stereo = not self._stereo
+        state = "ENABLED" if self._stereo else "DISABLED"
+        print(f"[TTS] Stereo spatialization: {state}")
+        return self._stereo
+
+    @property
+    def lang(self) -> str:
+        """Return current TTS language code."""
+        return self._lang
+
+    def set_lang(self, lang: str) -> str:
+        """Set active language code (en, hi, hinglish)."""
+        if lang in ("en", "hi", "hinglish"):
+            self._lang = lang
+            print(f"[TTS] Language set to: {self._lang}")
+        return self._lang
+
+    def cycle_lang(self) -> str:
+        """Cycle through supported languages: en -> hi -> hinglish -> en."""
+        order = ["en", "hi", "hinglish"]
+        idx = order.index(self._lang) if self._lang in order else 0
+        self._lang = order[(idx + 1) % len(order)]
+        print(f"[TTS] Language switched to: {self._lang}")
+        return self._lang
+
     def speak(self, message: str) -> None:
+
         """
         Enqueue *message* for asynchronous speech output.
 
@@ -231,22 +387,55 @@ class TTSEngine:
         if self._engine_pref == "kokoro":
             try:
                 from kokoro_onnx import Kokoro  # noqa: PLC0415
-                # Resolve model files relative to a models/tts/ directory
-                # that sits two levels above this src/ file.
                 from pathlib import Path as _P
                 _tts_dir = _P(__file__).resolve().parent.parent / "models" / "tts"
-                _onnx    = _tts_dir / "kokoro-v1.0.onnx"
-                _voices  = _tts_dir / "voices-v1.0.bin"
 
-                if _onnx.exists() and _voices.exists():
+                # ── ONNX model file: prefer renamed copy, fall back to HF cache path
+                _onnx = _tts_dir / "kokoro-v1.0.onnx"
+                if not _onnx.exists():
+                    # onnx-community layout stores it under onnx/model.onnx
+                    _onnx_alt = _tts_dir / "onnx" / "model.onnx"
+                    if _onnx_alt.exists():
+                        _onnx = _onnx_alt
+
+                # ── Voices file: support both legacy pack and per-voice layout
+                # Legacy:  voices-v1.0.bin  (hexgrad/Kokoro-82M-ONNX, now deleted)
+                # New:     voices/<name>.bin (onnx-community/Kokoro-82M-v1.0-ONNX)
+                _voices_legacy = _tts_dir / "voices-v1.0.bin"
+                # Map our lang to the appropriate per-voice filename
+                _VOICE_FILE_MAP = {
+                    "en":       "af_heart.bin",
+                    "hi":       "hf_alpha.bin",
+                    "hinglish": "hf_alpha.bin",
+                }
+                _voice_filename = _VOICE_FILE_MAP.get(self._lang, "af_heart.bin")
+                # Check both possible locations the HF downloader may place the file
+                _voices_per_voice = _tts_dir / "voices" / _voice_filename
+                _voices_flat      = _tts_dir / _voice_filename
+                _voices = (
+                    _voices_legacy    if _voices_legacy.exists()
+                    else _voices_per_voice if _voices_per_voice.exists()
+                    else _voices_flat      if _voices_flat.exists()
+                    else None
+                )
+
+                if _onnx.exists() and _voices is not None:
                     # Explicitly CPU-only: we never share VRAM with
                     # YOLO26 or Depth Anything V2.
-                    self._kokoro = Kokoro(str(_onnx), str(_voices))
-                    print("[TTS] Kokoro-82M loaded (CPUExecutionProvider).")
+                    try:
+                        import onnxruntime as _ort
+                        _sess = _ort.InferenceSession(str(_onnx), providers=["CPUExecutionProvider"])
+                        self._kokoro = Kokoro.from_session(_sess, str(_voices))
+                    except Exception:
+                        self._kokoro = Kokoro(str(_onnx), str(_voices))
+                    print(f"[TTS] Kokoro-82M loaded — model: {_onnx.name}, voice: {_voices.name}")
                     return "kokoro"
                 else:
+                    _missing = []
+                    if not _onnx.exists():    _missing.append("kokoro-v1.0.onnx (or onnx/model.onnx)")
+                    if _voices is None:       _missing.append(f"{_voice_filename} (or voices-v1.0.bin)")
                     print("[TTS] Kokoro model files not found in models/tts/.")
-                    print("[TTS]   Expected: kokoro-v1.0.onnx + voices-v1.0.bin")
+                    print(f"[TTS]   Missing: {', '.join(_missing)}")
                     print("[TTS] Falling back to Piper TTS.")
             except ImportError:
                 print("[TTS] kokoro-onnx not installed. Falling back to Piper.")
@@ -327,34 +516,136 @@ class TTSEngine:
             except Exception as exc:
                 print(f"[TTS] pyttsx3 init error in worker: {exc}")
 
+    @functools.lru_cache(maxsize=256)
+    def _synthesize_clause_cached(self, text: str) -> tuple[np.ndarray, int]:
+        """
+        Synthesize a clause string to a 1D mono float32 waveform with LRU caching (FR-4.1).
+        Cached array is read-only float32; callers copy or view.
+        """
+        if self._backend == "piper" and self._piper_voice is not None:
+            from piper.voice import SynthesisConfig
+            syn_config = SynthesisConfig(
+                length_scale=1.0 / self._speech_rate_scale,
+            )
+            chunks = list(self._piper_voice.synthesize(text, syn_config=syn_config))
+            if not chunks:
+                return np.zeros(0, dtype=np.float32), 22050
+            audio_array = np.concatenate([c.audio_float_array for c in chunks])
+            sample_rate = chunks[0].sample_rate
+            return audio_array, sample_rate
+
+        elif self._backend == "kokoro" and self._kokoro is not None:
+            _LANG_MAP: dict[str, tuple[str, str]] = {
+                "en":       ("en-us", "af_heart"),
+                "hi":       ("hi",    "hf_alpha"),
+                "hinglish": ("hi",    "hf_alpha"),
+            }
+            kokoro_lang, kokoro_voice = _LANG_MAP.get(self._lang, ("en-us", "af_heart"))
+            samples, sr = self._kokoro.create(
+                text,
+                voice=kokoro_voice,
+                speed=self._speech_rate_scale,
+                lang=kokoro_lang,
+            )
+            return samples, sr
+
+        return np.zeros(0, dtype=np.float32), 22050
+
+    def pan_audio(self, audio_mono: np.ndarray, direction: str = "center") -> np.ndarray:
+        """Pan mono waveform using current engine stereo configuration (FR-4.2)."""
+        return pan_audio(audio_mono, direction=direction, stereo=self._stereo)
+
+    def get_cache_stats(self) -> dict:
+        """Return LRU cache hit/miss statistics (FR-5.4)."""
+        info = self._synthesize_clause_cached.cache_info()
+        total = info.hits + info.misses
+        return {
+            "hits": info.hits,
+            "misses": info.misses,
+            "currsize": info.currsize,
+            "maxsize": info.maxsize,
+            "hit_ratio": info.hits / max(total, 1),
+        }
+
+    def _worker_loop(self) -> None:
+        """
+        Background daemon thread.
+        Continuously dequeues messages and synthesises + plays audio.
+        Supports 15s 800Hz bone-conduction heartbeat when idle (FR-4.3).
+        """
+        native_speaker = None
+        if self._backend == "win32com":
+            try:
+                import pythoncom
+                import win32com.client
+                pythoncom.CoInitialize()
+                native_speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                native_speaker.Rate = 1
+            except Exception as exc:
+                print(f"[TTS] win32com init error in worker: {exc}")
+
+        pyttsx3_engine = None
+        if self._backend == "pyttsx3":
+            try:
+                import pyttsx3
+                pyttsx3_engine = pyttsx3.init()
+            except Exception as exc:
+                print(f"[TTS] pyttsx3 init error in worker: {exc}")
+
         while True:
             try:
-                # Block indefinitely until a message arrives.
-                _priority, _counter, text = self._queue.get(timeout=1.0)
+                item = self._queue.get(timeout=1.0)
             except queue.Empty:
-                # Timeout — loop back and check self._running.
                 if not self._running:
                     break
+                # System-alive heartbeat (FR-4.3): 15ms @ 800Hz after 15s of silence
+                if self._heartbeat and _SD_AVAILABLE:
+                    if self._staleness_fn is not None and self._staleness_fn():
+                        continue
+                    now = time.monotonic()
+                    if (now - self.last_spoken_time) >= 15.0:
+                        try:
+                            tick = generate_tone(800.0, 0.015, sr=22050, amp=0.15)
+                            tick_out = pan_audio(tick, direction="center", stereo=self._stereo)
+                            sd.play(tick_out, samplerate=22050, blocking=True)
+                            self.last_spoken_time = time.monotonic()
+                        except Exception:
+                            pass
+
                 continue
 
-            # Poison-pill sentinel → clean exit.
+            if len(item) == 4:
+                _priority, _counter, text, enqueued_at = item
+            else:
+                _priority, _counter, text = item
+                enqueued_at = time.monotonic()
+
             if text is _STOP_SENTINEL:
                 self._queue.task_done()
                 break
 
-            # ── Synthesise and play ──────────────────────────────────────────
+            # Drop stale announcements that waited in queue for > 1.8s (prevents phantom chatter)
+            age = time.monotonic() - enqueued_at
+            if age > 1.8 and not ("Obstacle ahead" in text or "camera" in text.lower()):
+                print(f"[TTS] Dropped stale announcement ({age:.1f}s old): {text}")
+                self._queue.task_done()
+                continue
+
             try:
                 if self._backend == "kokoro":
                     self._play_kokoro(text)
                 elif self._backend == "piper":
                     self._play_piper(text)
                 elif self._backend == "win32com" and native_speaker:
-                    native_speaker.Speak(text, 0)   # 0 = synchronous
+                    native_speaker.Speak(text, 0)
+                    self.last_spoken_time = time.monotonic()
                 elif self._backend == "espeak":
                     self._play_espeak(text)
+                    self.last_spoken_time = time.monotonic()
                 elif self._backend == "pyttsx3" and pyttsx3_engine:
                     pyttsx3_engine.say(text)
                     pyttsx3_engine.runAndWait()
+                    self.last_spoken_time = time.monotonic()
             except Exception as exc:
                 print(f"[TTS] Playback error: {exc}")
             finally:
@@ -362,81 +653,100 @@ class TTSEngine:
 
     def _play_piper(self, text: str) -> None:
         """
-        Synthesise *text* with Piper and stream PCM frames directly to
-        sounddevice. No temporary .wav file is created on disk.
-
-        ``PiperVoice.synthesize()`` returns an iterable of ``AudioChunk``
-        objects. Each chunk carries:
-            - ``audio_float_array`` : np.ndarray (float32, already in [-1, 1])
-            - ``sample_rate``       : int  (e.g. 22050 or 16000)
-            - ``sample_channels``   : int  (almost always 1 for Piper voices)
-        We concatenate all chunks into one array and play them in a single
-        blocking call so there are no click artefacts between sentences.
+        Synthesise text with Piper using clause-level LRU cache, 80ms Hann earcon,
+        and safe stereo panning (FR-4.1–FR-4.3).
         """
         if self._piper_voice is None:
             return
 
-        from piper.voice import SynthesisConfig
+        is_critical = text.strip().upper().startswith("CRITICAL")
+        direction = detect_direction_from_text(text)
 
-        syn_config = SynthesisConfig(
-            length_scale=1.0 / self._speech_rate_scale,   # speed control
-        )
+        synth_text = text
+        if is_critical and not self._critical_sound:
+            if text.upper().startswith("CRITICAL:"):
+                synth_text = text[9:].strip()
+            elif text.upper().startswith("CRITICAL"):
+                synth_text = text[8:].strip()
 
-        chunks = list(self._piper_voice.synthesize(text, syn_config=syn_config))
-        if not chunks:
+        audio_mono, sample_rate = self._synthesize_clause_cached(synth_text)
+        if audio_mono.size == 0:
             return
+        audio_mono = audio_mono.copy()
 
-        # Concatenate all sentence chunks into one continuous array.
-        audio_array = np.concatenate([c.audio_float_array for c in chunks])
-        sample_rate  = chunks[0].sample_rate
+        # Prepend 80ms dual-tone Hann earcon chime on CRITICAL alerts if critical_sound enabled (FR-4.3)
+        if is_critical and self._critical_sound:
+            tone1 = generate_tone(880.0, 0.040, sr=sample_rate, amp=0.35)
+            tone2 = generate_tone(1320.0, 0.040, sr=sample_rate, amp=0.35)
+            chime = np.concatenate([tone1, tone2])
+            audio_mono = np.concatenate([chime, audio_mono])
+
+        audio_output = pan_audio(audio_mono, direction=direction, stereo=self._stereo)
+
+        # Critical alerts must NEVER be silenced by the interrupt event that enqueued them
+        if is_critical:
+            self._interrupt_event.clear()
 
         if _SD_AVAILABLE and not self._interrupt_event.is_set():
-            # blocking=True: worker thread waits for playback to finish
-            # before dequeuing the next message. Overlapping speech is
-            # confusing for a blind user.
-            sd.play(audio_array, samplerate=sample_rate, blocking=True)
+            try:
+                sd.play(audio_output, samplerate=sample_rate, blocking=True)
+                self.last_spoken_time = time.monotonic()
+            except Exception as exc:
+                print(f"[TTS] Audio playback error: {exc}")
         else:
             print(f"[TTS][NO AUDIO] {text}")
-        self._interrupt_event.clear()   # consume the interrupt signal
+        self._interrupt_event.clear()
 
     def _play_kokoro(self, text: str) -> None:
         """
-        Synthesise *text* with Kokoro-82M ONNX and play via sounddevice.
-
-        Kokoro always returns ``(samples: np.ndarray[float32], sr: int)``
-        where ``sr == 24000``. No temporary files are created on disk.
-
-        CPU isolation: Kokoro was initialised without CUDA providers so
-        it never competes with YOLO26 / Depth Anything V2 for VRAM.
+        Synthesise text with Kokoro-82M using clause-level LRU cache, 80ms Hann earcon,
+        and safe stereo panning (FR-4.1–FR-4.3).
         """
         if self._kokoro is None:
             return
 
-        # Map our --lang flag to Kokoro's (lang_code, voice_id) pairs.
-        # hf_alpha = Hindi female voice, af_heart = English female voice.
-        _LANG_MAP: dict[str, tuple[str, str]] = {
-            "en":       ("en-us", "af_heart"),
-            "hi":       ("hi",    "hf_alpha"),
-            "hinglish": ("hi",    "hf_alpha"),  # Roman Hinglish phonemised as Hindi
-        }
-        kokoro_lang, kokoro_voice = _LANG_MAP.get(self._lang, ("en-us", "af_heart"))
+        is_critical = text.strip().upper().startswith("CRITICAL")
+        direction = detect_direction_from_text(text)
+
+        synth_text = text
+        if is_critical and not self._critical_sound:
+            if text.upper().startswith("CRITICAL:"):
+                synth_text = text[9:].strip()
+            elif text.upper().startswith("CRITICAL"):
+                synth_text = text[8:].strip()
 
         try:
-            samples, sr = self._kokoro.create(
-                text,
-                voice=kokoro_voice,
-                speed=self._speech_rate_scale,
-                lang=kokoro_lang,
-            )
+            audio_mono, sample_rate = self._synthesize_clause_cached(synth_text)
         except Exception as exc:
             print(f"[TTS] Kokoro synthesis error: {exc}")
             return
 
+        if audio_mono.size == 0:
+            return
+        audio_mono = audio_mono.copy()
+
+        # Prepend 80ms dual-tone Hann earcon chime on CRITICAL alerts if critical_sound enabled (FR-4.3)
+        if is_critical and self._critical_sound:
+            tone1 = generate_tone(880.0, 0.040, sr=sample_rate, amp=0.35)
+            tone2 = generate_tone(1320.0, 0.040, sr=sample_rate, amp=0.35)
+            chime = np.concatenate([tone1, tone2])
+            audio_mono = np.concatenate([chime, audio_mono])
+
+        audio_output = pan_audio(audio_mono, direction=direction, stereo=self._stereo)
+
+        # Critical alerts must NEVER be silenced by the interrupt event that enqueued them
+        if is_critical:
+            self._interrupt_event.clear()
+
         if _SD_AVAILABLE and not self._interrupt_event.is_set():
-            sd.play(samples, samplerate=sr, blocking=True)
+            try:
+                sd.play(audio_output, samplerate=sample_rate, blocking=True)
+                self.last_spoken_time = time.monotonic()
+            except Exception as exc:
+                print(f"[TTS] Audio playback error: {exc}")
         else:
             print(f"[TTS][NO AUDIO] {text}")
-        self._interrupt_event.clear()   # consume the interrupt signal
+        self._interrupt_event.clear()
 
 
 
@@ -461,11 +771,11 @@ class TTSEngine:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _enqueue(self, message: str, priority: int) -> None:
-        """Thread-safe enqueue with monotonic counter tie-breaker."""
+        """Thread-safe enqueue with monotonic counter tie-breaker and creation timestamp."""
         with self._counter_lock:
             self._counter += 1
             counter = self._counter
-        self._queue.put((priority, counter, message))
+        self._queue.put((priority, counter, message, time.monotonic()))
 
     def _flush_normal_queue(self) -> None:
         """
@@ -482,22 +792,54 @@ class TTSEngine:
           3. Drain normal-priority queue items (stale obstacle announcements).
           4. Re-insert any CRITICAL items and the stop sentinel.
         """
-        # ── Step 1+2: Stop current audio and signal the playback methods ──
-        if _SD_AVAILABLE:
-            sd.stop()
-        self._interrupt_event.set()
-
-        # ── Steps 3+4: Rebuild queue keeping only high-priority items ─────
+        # ── Step 1: Signal interrupt event and drain normal-priority queue items ──
+        # Note: We deliberately do NOT call sd.stop() cross-thread because PortAudio
+        # on Windows WASAPI/MME raises native access violations (0xC0000005) when Pa_StopStream
+        # is called from a thread outside the audio callback while blocked in Pa_WriteStream.
+        # ── Step 2: Flush unplayed backlog so only fresh alerts are spoken ─────
+        # All pending items (both normal and stale criticals waiting in queue)
+        # are discarded so speech never lags behind the real-time scene.
         kept: list[tuple] = []
         while True:
             try:
                 item = self._queue.get_nowait()
-                priority = item[0]
-                text     = item[2]
-                if priority == _PRIORITY_CRITICAL or text is _STOP_SENTINEL:
+                text = item[2]
+                if text is _STOP_SENTINEL:
                     kept.append(item)
             except queue.Empty:
                 break
 
+        for item in kept:
+            self._queue.put(item)
+
+    def purge_label(self, label: str) -> None:
+        """Purge pending queue items containing a specific label (e.g. when obstacle left the frame)."""
+        kept: list[tuple] = []
+        purged = False
+        while True:
+            try:
+                item = self._queue.get_nowait()
+                text = item[2]
+                if text is not _STOP_SENTINEL and label.lower() in text.lower():
+                    purged = True
+                    continue
+                kept.append(item)
+            except queue.Empty:
+                break
+        for item in kept:
+            self._queue.put(item)
+        if purged:
+            print(f"[TTS] Purged pending announcements for departed obstacle: {label}")
+
+    def clear_queue(self) -> None:
+        """Purge all pending unplayed messages from queue (e.g. when scene is clear)."""
+        kept: list[tuple] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+                if item[2] is _STOP_SENTINEL:
+                    kept.append(item)
+            except queue.Empty:
+                break
         for item in kept:
             self._queue.put(item)

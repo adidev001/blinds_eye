@@ -279,6 +279,130 @@ TEMPLATES: dict[str, dict[str, str]] = {
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Curated COCO Plural Maps (FR-3.3)
+# ══════════════════════════════════════════════════════════════════════════
+
+COCO_PLURALS_EN: dict[str, str] = {
+    "person":           "people",
+    "bicycle":          "bicycles",
+    "car":              "cars",
+    "motorcycle":       "motorcycles",
+    "airplane":         "airplanes",
+    "bus":              "buses",
+    "train":            "trains",
+    "truck":            "trucks",
+    "boat":             "boats",
+    "traffic light":    "traffic lights",
+    "fire hydrant":     "fire hydrants",
+    "stop sign":        "stop signs",
+    "parking meter":    "parking meters",
+    "bench":            "benches",
+    "bird":             "birds",
+    "cat":              "cats",
+    "dog":              "dogs",
+    "horse":            "horses",
+    "sheep":            "sheep",
+    "cow":              "cows",
+    "elephant":         "elephants",
+    "bear":             "bears",
+    "zebra":            "zebras",
+    "giraffe":          "giraffes",
+    "backpack":         "backpacks",
+    "umbrella":         "umbrellas",
+    "handbag":          "handbags",
+    "tie":              "ties",
+    "suitcase":         "suitcases",
+    "chair":            "chairs",
+    "couch":            "couches",
+    "potted plant":     "potted plants",
+    "bed":              "beds",
+    "dining table":     "dining tables",
+    "toilet":           "toilets",
+    "tv":               "tvs",
+    "laptop":           "laptops",
+    "mouse":            "mice",
+    "remote":           "remotes",
+    "keyboard":         "keyboards",
+    "cell phone":       "cell phones",
+    "bottle":           "bottles",
+    "cup":              "cups",
+    "fork":             "forks",
+    "knife":            "knives",
+    "spoon":            "spoons",
+    "bowl":             "bowls",
+    "book":             "books",
+    "clock":            "clocks",
+    "vase":             "vases",
+    "scissors":         "scissors",
+}
+
+COCO_PLURALS_HI: dict[str, str] = {
+    "person":           "लोग",
+    "bicycle":          "साइकिलें",
+    "car":              "कारें",
+    "motorcycle":       "बाइक",
+    "airplane":         "हवाई जहाज़",
+    "bus":              "बसें",
+    "train":            "ट्रेनें",
+    "truck":            "ट्रक",
+    "boat":             "नावें",
+    "traffic light":    "ट्रैफ़िक लाइटें",
+    "fire hydrant":     "फायर हाइड्रेंट",
+    "stop sign":        "स्टॉप साइन",
+    "bench":            "बेंचें",
+    "bird":             "पक्षी",
+    "cat":              "बिल्लियाँ",
+    "dog":              "कुत्ते",
+    "horse":            "घोड़े",
+    "sheep":            "भेड़ें",
+    "cow":              "गायें",
+    "elephant":         "हाथी",
+    "chair":            "कुर्सियाँ",
+    "couch":            "सोफ़े",
+    "bed":              "बिस्तर",
+    "dining table":     "मेज़ें",
+    "bottle":           "बोतलें",
+    "cup":              "कप",
+    "book":             "किताबें",
+    "clock":            "घड़ियाँ",
+}
+
+COCO_PLURALS_HINGLISH: dict[str, str] = {
+    "person":           "log",
+    "bicycle":          "cycles",
+    "car":              "gaadiyan",
+    "motorcycle":       "bikes",
+    "bus":              "basen",
+    "train":            "trains",
+    "truck":            "trucks",
+    "bench":            "benches",
+    "cat":              "billiyan",
+    "dog":              "kutte",
+    "chair":            "kursiyan",
+    "couch":            "couches",
+    "bed":              "beds",
+    "bottle":           "bottles",
+    "cup":              "cups",
+    "book":             "kitaben",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Dual-Regime Distance Quantization (FR-3.1)
+# ══════════════════════════════════════════════════════════════════════════
+
+def quantize_distance(depth: float) -> float:
+    """
+    Quantize metric depth into perceptual bins (FR-3.1):
+    - < 1.5m : round to nearest 0.1m
+    - >= 1.5m: round to nearest 0.5m
+    """
+    if depth < 1.5:
+        return round(float(depth), 1)
+    return round(float(depth) * 2.0) / 2.0
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # LocalizationFormatter
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -333,6 +457,15 @@ class LocalizationFormatter:
             return direction
         return self._dirs.get(direction, direction)
 
+    def get_plural_label(self, label: str) -> str:
+        """Return the curated plural form of *label* in the current language."""
+        if self.lang == "en":
+            return COCO_PLURALS_EN.get(label, label + "s" if not label.endswith("s") else label)
+        elif self.lang == "hi":
+            return COCO_PLURALS_HI.get(label, self.translate_label(label))
+        else:  # hinglish
+            return COCO_PLURALS_HINGLISH.get(label, self.translate_label(label) + "s")
+
     # ── Sentence builders ─────────────────────────────────────────────────
 
     def format_detection(
@@ -340,23 +473,155 @@ class LocalizationFormatter:
         label: str,
         direction: str,
         depth_meters: float | None,
+        vertical_zone: str = "normal",
+        is_approaching: bool = False,
     ) -> str:
         """
-        Build a single-object detection sentence.
+        Build a single-object detection sentence (FR-1.4, FR-3.2).
 
         Parameters
         ----------
-        label       : COCO English label string
-        direction   : ``"left"`` | ``"center"`` | ``"right"``
-        depth_meters: metric depth float, or ``None`` if depth is disabled
+        label          : COCO English label string
+        direction      : ``"left"`` | ``"center"`` | ``"right"``
+        depth_meters   : metric depth float, or ``None`` if depth is disabled
+        vertical_zone  : ``"normal"`` | ``"overhead"`` | ``"ground"``
+        is_approaching : whether object exceeds kinematic approaching threshold
         """
         l = self.translate_label(label)
         d = self.translate_direction(direction)
+
+        if self.lang == "en":
+            if vertical_zone == "overhead":
+                l = f"overhead {l}"
+            elif vertical_zone == "ground":
+                l = f"ground-level {l}"
+            if is_approaching:
+                l = f"approaching {l}"
+        elif self.lang == "hi":
+            if vertical_zone == "overhead":
+                l = f"सिर के पास {l}"
+            elif vertical_zone == "ground":
+                l = f"नीचे जमीन पर {l}"
+            if is_approaching:
+                l = f"आता हुआ {l}"
+        else:  # hinglish
+            if vertical_zone == "overhead":
+                l = f"sir ke paas {l}"
+            elif vertical_zone == "ground":
+                l = f"neeche zameen par {l}"
+            if is_approaching:
+                l = f"aata hua {l}"
+
         if depth_meters is not None:
             return self._tmpl["with_depth"].format(
                 label=l, dir=d, dist=f"{depth_meters:.1f}"
             )
         return self._tmpl["no_depth"].format(label=l, dir=d)
+
+    def format_crowd_clause(
+        self,
+        label: str,
+        direction: str,
+        count: int,
+        min_depth: float,
+    ) -> str:
+        """
+        Build a compressed crowd clause (FR-3.2, FR-3.3).
+        Buckets counts strictly into 2, 3, or 'multiple' (>= 4).
+        """
+        q_depth = quantize_distance(min_depth)
+        d_str = f"{q_depth:.1f}"
+        plural = self.get_plural_label(label)
+
+        if self.lang == "en":
+            if direction == "center":
+                d_dir = "ahead"
+            elif direction == "left":
+                d_dir = "on the left"
+            elif direction == "right":
+                d_dir = "on the right"
+            else:
+                d_dir = direction
+
+            if count in (2, 3):
+                return f"{count} {plural} {d_dir}, closest at {d_str} meters"
+            else:
+                return f"multiple {plural} {d_dir}, closest at {d_str} meters"
+        elif self.lang == "hi":
+            d_dir = self.translate_direction(direction)
+            if count in (2, 3):
+                return f"{d_dir} {count} {plural}, सबसे पास {d_str} मीटर पर"
+            else:
+                return f"{d_dir} कई {plural}, सबसे पास {d_str} मीटर पर"
+        else:  # hinglish
+            d_dir = self.translate_direction(direction)
+            if count in (2, 3):
+                return f"{d_dir} {count} {plural}, sabse paas {d_str} meter par"
+            else:
+                return f"{d_dir} kai {plural}, sabse paas {d_str} meter par"
+
+    def format_fast_critical(
+        self,
+        label: str,
+        direction: str,
+        depth: float,
+    ) -> str:
+        """
+        Build a high-speed vehicle Gate C critical warning (FR-1.3, FR-3.2).
+        """
+        q_depth = quantize_distance(depth)
+        d_str = f"{q_depth:.1f}"
+        l = self.translate_label(label)
+
+        if self.lang == "en":
+            d_dir = "ahead" if direction == "center" else f"on the {direction}"
+            return f"CRITICAL: Fast approaching {l} {d_dir} at {d_str} meters"
+        elif self.lang == "hi":
+            d_dir = self.translate_direction(direction)
+            return f"CRITICAL: तेज़ आता हुआ {l} {d_dir}, {d_str} मीटर पर"
+        else:  # hinglish
+            d_dir = self.translate_direction(direction)
+            return f"CRITICAL: Tez aata hua {l} {d_dir}, {d_str} meter par"
+
+    def format_system_alert(
+        self,
+        alert_key: str,
+        depth: float | None = None,
+    ) -> str:
+        """
+        Format a system-level or curtain alert (FR-1.5, FR-2.2, FR-2.3, FR-3.2).
+        Supported keys: 'obstacle_ahead', 'camera_lost', 'camera_restored', 'low_light'.
+        """
+        d_str = f"{quantize_distance(depth):.1f}" if depth is not None else ""
+        if alert_key == "obstacle_ahead":
+            if self.lang == "en":
+                return f"obstacle ahead at {d_str} meters"
+            elif self.lang == "hi":
+                return f"सामने रुकावट, {d_str} मीटर पर"
+            else:
+                return f"saamne rukawat, {d_str} meter par"
+        elif alert_key == "camera_lost":
+            if self.lang == "en":
+                return "CRITICAL: Camera signal lost"
+            elif self.lang == "hi":
+                return "CRITICAL: कैमरा सिग्नल बंद है"
+            else:
+                return "CRITICAL: Camera signal band hai"
+        elif alert_key == "camera_restored":
+            if self.lang == "en":
+                return "Camera restored"
+            elif self.lang == "hi":
+                return "कैमरा चालू है"
+            else:
+                return "Camera chalu hai"
+        elif alert_key == "low_light":
+            if self.lang == "en":
+                return "Camera blocked or low light"
+            elif self.lang == "hi":
+                return "कैमरा ढका है या अंधेरा है"
+            else:
+                return "Camera dhaka hai ya andhera hai"
+        return self.system_message(alert_key)
 
     def format_announcement(self, items: list[str]) -> str:
         """
